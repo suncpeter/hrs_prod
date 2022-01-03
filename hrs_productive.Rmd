@@ -1,0 +1,428 @@
+---
+title: "Productive Engagement in the HRS"
+author: "Peter Sun"
+date: "January 2, 2022"
+output:
+  pdf_document:
+    number_sections: true
+    toc: true
+    toc_depth: 2
+header-includes:
+- \usepackage{enumitem}
+- \usepackage{amsmath}
+- \usepackage{amssymb}
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+---
+
+```{r setup, include=FALSE}
+options(scipen=999)
+knitr::opts_chunk$set(echo = TRUE)
+options(knitr.kable.NA = "") # omit NAs in Kable
+```
+
+\newpage
+# Load Packages and Data
+
+```{r message=F, error=F, warning=F}
+library(tidyverse)
+library(haven)
+library(sjlabelled)
+library(ggpubr)
+library(kableExtra)
+
+# Avoid select clashes
+select <- dplyr::select
+recode <- dplyr::recode
+summarize <- dplyr::summarize
+```
+
+\newpage
+# Re-Read Project-Level Environmental Variables
+
+```{r}
+readRenviron(".Renviron")
+```
+
+\newpage
+# Import RAND Long Demographics - Wave 7 (2004) and Wave 14 (2018)
+
+```{r}
+rand.long <- read_dta(Sys.getenv("HRS_LONG"),
+                    col_select = c(hhid, pn,
+                                   s7hhidpn, s14hhidpn, # w7, w14 spouse hhidpn
+                                   r7agey_e, # age w7
+                                   r14agey_e, # age w14
+                                   ragender, # gender
+                                   raracem, # race
+                                   raedyrs, # education
+                                   rahispan, # hispanic
+                                   raeduc)) %>% # edu categorical summary
+  haven::zap_formats() %>%
+  sjlabelled::remove_all_labels() %>%
+  as_tibble()
+```
+
+\newpage
+# Calculate 2004 Numbers Using RAND Long
+
+```{r}
+# Import 2004 RAND Fat File (File name: h04f1c.dta)
+rand.04 <- read_dta(Sys.getenv("HRS_2004_FAT"),
+                    col_select = c("hhidpn", "hhid", "pn",
+                                   
+                                   # adl helpers
+                                   starts_with("jg033_"),
+                                   
+                                   # iadl helpers
+                                   starts_with("jg055_"),
+                                   
+                                   # caregiving grandchildren
+                                   "je060", 
+                                   
+                                   # caregiving parental personal
+                                   "jf119", 
+                                   
+                                   # caregiving parental errands
+                                   "jf139")) %>%
+  haven::zap_formats() %>%
+  sjlabelled::remove_all_labels() %>%
+  as_tibble()
+
+# Identify participants who had an ADL or IADL helper
+# spouse_helper_sum counts the number of 2s (spouse helper) in jg033 and jg055
+# has_spouse_helper is 1 if there is at least one 2s, 0 if none
+rand.04b <- rand.04 %>%
+  mutate(spouse_helper_sum = rowSums(
+    ifelse(
+      select(., starts_with("jg033") | starts_with("jg055")) == 2, 1, 0
+    ), na.rm = TRUE)) %>%
+  mutate(has_spouse_helper = ifelse(spouse_helper_sum >= 1, 1, 0))
+
+# Extract participants who have a spousal ADL/IADL caregiver
+# Merge their spouse PN
+# Then create a dataset with hhid and pn of spouse and an indication of
+# whether or not they are a spousal caregiver
+spousal_caregivers <- rand.04b %>%
+  filter(has_spouse_helper == 1) %>%
+  select(hhid, pn, has_spouse_helper) %>%
+  left_join(rand.long %>% select(hhid, pn, s7hhidpn), by = c("hhid", "pn")) %>%
+  select(hhidpn = s7hhidpn, caregiver_spousal = has_spouse_helper)
+
+# Merge the spousal_caregivers data back to the dataset
+rand.04c <- rand.04b %>%
+  left_join(spousal_caregivers, by = c("hhidpn"))
+
+# Format parental/grandchildren caregivers
+# Create caregiver_parental if either personal or errands == 1
+rand.04d <- rand.04c %>%
+  mutate(across(.cols = c(je060, jf119, jf139), 
+    ~recode(., `1` = 1, `5` = 0, `8` = 0, `9` = 0, .default = NA_real_))) %>%
+  rename(caregiver_grandchildren = je060,
+         caregiver_parental_personal = jf119,
+         caregiver_parental_errands = jf139) %>%
+  mutate(caregiver_parental =
+    ifelse(caregiver_parental_personal == 1 | caregiver_parental_errands == 1,
+           1, 0))
+
+# Count
+table(rand.04d$caregiver_spousal)
+table(rand.04d$caregiver_grandchildren)
+table(rand.04d$caregiver_parental)
+table(rand.04d$caregiver_parental_personal)
+table(rand.04d$caregiver_parental_errands)
+```
+
+\newpage
+# Import Geography
+
+```{r}
+region.18 <- read_dta(Sys.getenv("HRS_REGION_2018_82"),
+                      col_select = c(hhid, pn, beale2013_04, beale2013_18)) %>%
+  haven::zap_formats() %>%
+  sjlabelled::remove_all_labels() %>%
+  as_tibble()
+```
+
+\newpage
+# Calculate Age 51+ Caregiving Rates and Merge/Format Additional Variables
+
+```{r}
+rand.04.over51 <- rand.04d %>%
+  left_join(rand.long, by = c("hhid", "pn")) %>%
+  filter(r7agey_e >= 51) %>%
+  mutate(raeduc = recode(raeduc, `1` = "Less than college", 
+                         `2` = "Less than college", 
+                         `3` = "Less than college",
+                         `4` = "Less than college", 
+                         `5` = "College degree or more")) %>%
+  mutate(rahispan = recode(rahispan, `0` = "Not Hispanic",
+                           `1` = "Hispanic")) %>%
+  mutate(raracem = recode(raracem, `1` = "White/Caucasian",
+                          `2` = "Black/African American", `3` = "Other")) %>%
+  mutate(ragender = recode(ragender, `1` = "Male", `2` = "Female")) %>%
+  left_join(region.18, by = c("hhid", "pn")) %>%
+  mutate(beale2013_04 = recode(beale2013_04, `1` = "Urban", 
+                         `2` = "Suburban", `3` = "Ex-Urban", #`9` = "No Match",
+                         .default = NA_character_))
+
+# Check beale codes
+nrow(rand.04.over51)
+rand.04.over51 %>%
+  count(beale2013_04) # 575 missing geography
+table(rand.04.over51$beale2013_04)
+
+nrow(rand.04.over51)
+table(rand.04.over51$caregiver_spousal)
+table(rand.04.over51$caregiver_grandchildren)
+table(rand.04.over51$caregiver_parental)
+table(rand.04.over51$caregiver_parental_personal)
+table(rand.04.over51$caregiver_parental_errands)
+```
+
+\newpage
+# Calculate 2018 Numbers Using RAND Long
+
+Repeat above steps for 2018
+
+```{r}
+# Import 2018 RAND Fat File (File name: h04f1c.dta)
+rand.18 <- read_dta(Sys.getenv("HRS_2018_FAT"),
+                    col_select = c("hhidpn", "hhid", "pn",
+                                   
+                                   # adl helpers
+                                   starts_with("qg033_"),
+                                   
+                                   # iadl helpers
+                                   starts_with("qg055_"),
+                                   
+                                   # caregiving grandchildren
+                                   "qe060", 
+                                   
+                                   # caregiving parental personal
+                                   "qf119", 
+                                   
+                                   # caregiving parental errands
+                                   "qf139")) %>%
+  haven::zap_formats() %>%
+  sjlabelled::remove_all_labels() %>%
+  as_tibble()
+
+# Identify participants who had an ADL or IADL helper
+# spouse_helper_sum counts the number of 2s (spouse helper) in jg033 and jg055
+# has_spouse_helper is 1 if there is at least one 2s, 0 if none
+rand.18b <- rand.18 %>%
+  mutate(spouse_helper_sum = rowSums(
+    ifelse(
+      select(., starts_with("qg033") | starts_with("qg055")) == 2, 1, 0
+    ), na.rm = TRUE)) %>%
+  mutate(has_spouse_helper = ifelse(spouse_helper_sum >= 1, 1, 0))
+
+# Extract participants who have a spousal ADL/IADL caregiver
+# Merge their spouse PN
+# Then create a dataset with hhid and pn of spouse and an indication of
+# whether or not they are a spousal caregiver
+spousal_caregivers.18 <- rand.18b %>%
+  filter(has_spouse_helper == 1) %>%
+  select(hhid, pn, has_spouse_helper) %>%
+  left_join(rand.long %>% select(hhid, pn, s14hhidpn), 
+            by = c("hhid", "pn")) %>%
+  select(hhidpn = s14hhidpn, caregiver_spousal = has_spouse_helper)
+
+# Merge the spousal_caregivers data back to the dataset
+rand.18c <- rand.18b %>%
+  left_join(spousal_caregivers.18, by = c("hhidpn"))
+
+# Format parental/grandchildren caregivers
+# Create caregiver_parental if either personal or errands == 1
+rand.18d <- rand.18c %>%
+  mutate(across(.cols = c(qe060, qf119, qf139), 
+    ~recode(., `1` = 1, `5` = 0, `8` = 0, `9` = 0, .default = NA_real_))) %>%
+  rename(caregiver_grandchildren = qe060,
+         caregiver_parental_personal = qf119,
+         caregiver_parental_errands = qf139) %>%
+  mutate(caregiver_parental =
+    ifelse(caregiver_parental_personal == 1 | caregiver_parental_errands == 1,
+           1, 0))
+
+# Count
+table(rand.18d$caregiver_spousal)
+table(rand.18d$caregiver_grandchildren)
+table(rand.18d$caregiver_parental)
+table(rand.18d$caregiver_parental_personal)
+table(rand.18d$caregiver_parental_errands)
+```
+
+\newpage
+# Calculate Age 51+ Caregiving Rates and Merge/Format Additional Variables
+
+```{r}
+rand.18.over51 <- rand.18d %>%
+  left_join(rand.long, by = c("hhid", "pn")) %>%
+  filter(r14agey_e >= 51) %>%
+  mutate(raeduc = recode(raeduc, `1` = "Less than college", 
+                         `2` = "Less than college", 
+                         `3` = "Less than college", 
+                         `4` = "Less than college",
+                         `5` = "College degree or more")) %>%
+  mutate(rahispan = recode(rahispan, `0` = "Not Hispanic",
+                           `1` = "Hispanic")) %>%
+  mutate(raracem = recode(raracem, `1` = "White/Caucasian", 
+                          `2` = "Black/African American", `3` = "Other")) %>%
+  mutate(ragender = recode(ragender, `1` = "Male", `2` = "Female")) %>%
+  left_join(region.18, by = c("hhid", "pn")) %>%
+  mutate(beale2013_18 = recode(beale2013_18, `1` = "Urban",
+                               `2` = "Suburban", 
+                               `3` = "Ex-Urban", #`9` = "No Match",
+                               .default = NA_character_))
+
+# Check beale codes
+nrow(rand.18.over51)
+rand.18.over51 %>%
+  count(beale2013_18) # 384 missing geography
+table(rand.18.over51$beale2013_18)
+
+nrow(rand.18.over51)
+table(rand.18.over51$caregiver_spousal)
+table(rand.18.over51$caregiver_grandchildren)
+table(rand.18.over51$caregiver_parental)
+table(rand.18.over51$caregiver_parental_personal)
+table(rand.18.over51$caregiver_parental_errands)
+```
+
+\newpage
+# Merge and Simplify 2004 and 2018 Data
+
+```{r}
+r4 <- rand.04.over51 %>%
+  select(cs = caregiver_spousal, cp = caregiver_parental, 
+         cg = caregiver_grandchildren,
+         Sex = ragender, Hispanic = rahispan,
+         Race = raracem, Education = raeduc,
+         Geography = beale2013_04) %>%
+  mutate(Year = "2004")
+r18 <- rand.18.over51 %>%
+  select(cs = caregiver_spousal, cp = caregiver_parental, 
+         cg = caregiver_grandchildren,
+         Sex = ragender, Hispanic = rahispan,
+         Race = raracem, Education = raeduc, 
+         Geography = beale2013_18) %>%
+  mutate(Year = "2018")
+r.418 <- bind_rows(r4, r18) %>%
+  mutate(Caregiver_Sum = rowSums(select(., cs:cg), na.rm = T),
+         Caregiver = ifelse(Caregiver_Sum >= 1, 1, 0),
+         Caregiver_Multi = ifelse(Caregiver_Sum > 1, 1, 0)) %>%
+  select(-Caregiver_Sum)
+```
+
+\newpage
+# Total Sample Sizes (Age 51+)
+
+```{r}
+nrow(r4) # 2004
+nrow(r18) # 2018
+```
+
+\newpage
+# Contingency Tables
+
+```{r}
+# Function for contingency tables
+get_cont <- function(var) {
+  r.418 %>%
+    count(Year, Geography, {{ var }}) %>%
+    filter(!is.na(Geography)) %>%
+    #filter(!is.na({{ var }})) %>%
+    group_by(Year, Geography) %>%
+    mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+    kbl(booktabs = T, linesep = "", digits = 2) %>%
+    kable_styling(position = "center") %>%
+    kable_styling(latex_options = c("striped", "hold_position"))
+}
+
+# Get total estimates without cross-tabulation
+get_cont(Caregiver)
+
+# Get total estimates without cross-tabulation (MULTI)
+get_cont(Caregiver_Multi)
+
+# Types of caregivers
+get_cont(cs) # spousal
+get_cont(cp) # parental
+get_cont(cg) # grandchildren
+```
+
+\newpage
+# Plots
+
+```{r}
+get_count <- function(iv, caregiver_type) {
+  r.418 %>%
+    filter({{ caregiver_type }} == 1) %>%
+    count(Year, Geography, {{ iv }}) %>%
+    group_by(Year, Geography) %>%
+    mutate(pct = n / sum(n)) %>%
+    ungroup(Year, Geography) %>%
+    filter(!is.na(Geography)) %>%
+    filter(!is.na({{ iv }}))
+}
+
+create_plot <- function(df, iv, mytitle, upr_limit = 1) {
+  kab <- df %>%
+    mutate(pct = scales::percent(pct, accuracy = .1)) %>%
+    kbl(booktabs = T, linesep = "", digits = 1) %>%
+    kable_styling(position = "center") %>%
+    kable_styling(latex_options = c("striped", "hold_position"))
+  p <- ggplot(df, aes(x = Year, y = pct, fill = {{ iv }})) +
+      geom_bar(stat = "identity", width = 0.8, position = "dodge") +
+      facet_wrap(~Geography, scales = "fixed") +
+      theme_classic() +
+      scale_fill_grey() +
+      scale_y_continuous(labels = scales::percent, limits = c(0, upr_limit)) +
+      labs(y = "% Caregivers\n", x = "\nYear", title = mytitle, fill = "") +
+      theme(legend.position = "bottom")
+  return(list(kab = kab, p = p))
+}
+```
+
+\newpage
+# Caregiving Plot
+
+```{r}
+p1 <- create_plot(get_count(Sex, Caregiver), Sex, "Sex")
+p2 <- create_plot(get_count(Hispanic, Caregiver), Hispanic, "Hispanic")
+p3 <- create_plot(get_count(Race, Caregiver), Race, "Race")
+p4 <- create_plot(get_count(Education, Caregiver), Education, "Education")
+
+p5 <- ggpubr::ggarrange(p1$p, p2$p, p3$p, p4$p)
+p5
+ggsave(paste0("figures/", "caregiving.emf"), width = 12, height = 7, plot = p5)
+```
+
+\newpage
+# Multiple Caregiving Roles Plot
+
+```{r}
+# Multiple Caregiver Roles
+p6 <- create_plot(get_count(Sex, Caregiver_Multi), Sex, "Sex")
+p7 <- create_plot(get_count(Hispanic, Caregiver_Multi), Hispanic, "Hispanic")
+p8 <- create_plot(get_count(Race, Caregiver_Multi), Race, "Race")
+p9 <- create_plot(get_count(Education, Caregiver_Multi), Education, "Education")
+
+p10 <- ggpubr::ggarrange(p6$p, p7$p, p8$p, p9$p)
+p10
+```
+
+\newpage
+# Grandchild/Parent/Spousal Caregiving Plots
+
+```{r}
+# switch between cs/cp/cg
+p11 <- create_plot(get_count(Sex, cg), Sex, "Sex")
+p12 <- create_plot(get_count(Hispanic, cg), Hispanic, "Hispanic")
+p13 <- create_plot(get_count(Race, cg), Race, "Race")
+p14 <- create_plot(get_count(Education, cg), Education, "Education")
+p15 <- ggpubr::ggarrange(p11$p, p12$p, p13$p, p14$p)
+p15
+```
